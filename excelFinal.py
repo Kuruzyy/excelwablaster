@@ -1,101 +1,290 @@
 import tkinter as tk
-from tkinter import filedialog, scrolledtext, messagebox, ttk
-import sys
-import shutil
-import os
-import tempfile
-import platform
-import logging
-import random
-import time
-import threading
+from tkinter import filedialog, messagebox, ttk
+import sys, os, re, shutil, tempfile, platform, urllib.parse, logging, random, time, threading, queue
 import pandas as pd
-from openpyxl import load_workbook  # For updating Excel
-
+import psutil
+from threading import Lock
+from openpyxl import load_workbook
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchWindowException, WebDriverException, NoSuchElementException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, NoSuchWindowException, WebDriverException
 
+# Webdriver managers
 from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.core.os_manager import ChromeType
 from webdriver_manager.microsoft import EdgeChromiumDriverManager
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.edge.service import Service as EdgeService
+from selenium.webdriver.chrome.service import Service as ChromiumService
+from webdriver_manager.chrome import ChromeDriverManager as BraveChromeDriverManager  # for Brave
 
-# Default Timer Values
-TIMER_MIN = 10
-TIMER_MAX = 20
+# ---------------------------
+# CONFIGURATION
+# ---------------------------
+CONFIG = {
+    "SHEETS": {
+        "LIST": "LIST",
+        "MSGS": "MSGS",
+        "DOCS": "DOCS",
+        "MEDIA": "MEDIA",
+        "SETTINGS": "SETTINGS",
+    },
+    "COLUMNS": {
+        "LIST": {
+            "sender": "Sender",
+            "phone": "Phone Number",
+            "name": "Name",
+            "course": "Course of Interest",
+            "msg_code": "Message Code",
+            "doc_code": "Document Code",
+            "media_code": "Media Code",
+            "status": "Status",
+        },
+        "MSGS": {
+            "msg_code": "Message Code",
+            "message": "Message Encoded",
+        },
+        "DOCS": {
+            "code": "Document Code",
+            "files": ["BROCHURE_1", "BROCHURE_2", "BROCHURE_3", "BROCHURE_4"],
+        },
+        "MEDIA": {
+            "code": "Media Code",
+            "files": ["MEDIA_1", "MEDIA_2", "MEDIA_3", "MEDIA_4"],
+        },
+        "Settings": {
+            "wd_chrome_ver": "WD_CHROME_VER",
+            "wd_edge_ver": "WD_EDGE_VER",
+            "wd_brave_ver": "WD_BRAVE_VER",
+            "xpath_text": "XPATH_TEXT",
+            "xpath_send": "XPATH_SEND",
+            "xpath_attach": "XPATH_ATTACH",
+            "xpath_asend": "XPATH_ASEND",
+            "xpath_docs": "XPATH_DOCS",
+            "xpath_media": "XPATH_MEDIA",
+            "invalid_message": "INVALID_MSG",
+            "min_timer": "MIN_TIMER",
+            "max_timer": "MAX_TIMER",
+        },
+    },
+    "STATUS_VALUES": {
+        "INVALID": 0,
+        "SENT": 1,
+        "RETRY": 2,
+    },
+}
 
-# Set up logging
+# ---------------------------
+# Logging and Utility Functions
+# ---------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("whatsapp_blaster.log"),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler("whatsapp_blaster.log"), logging.StreamHandler()]
 )
 
-# Determine a persistent folder in the temp directory
-def get_persistent_temp_path():
-    temp_dir = tempfile.gettempdir()
-    persistent_temp_path = os.path.join(temp_dir, "whatsapp_blaster_data")
-    if not os.path.exists(persistent_temp_path):
-        os.makedirs(persistent_temp_path)
-    return persistent_temp_path
+def get_persistent_temp_path(instance_id=None):
+    if instance_id is not None:
+        path = os.path.join(tempfile.gettempdir(), f"whatsapp_blaster_data_{instance_id}")
+    else:
+        path = os.path.join(tempfile.gettempdir(), "whatsapp_blaster_data")
+    if not os.path.exists(path):
+        os.makedirs(path)
+    return path
 
-# User data path
-user_data_path = get_persistent_temp_path()
-
-# Global stop event
+# Create separate user data paths for each browser instance
+user_data_path_1 = get_persistent_temp_path("1")
+user_data_path_2 = get_persistent_temp_path("2")
 stop_event = threading.Event()
 
+# Log queues for system and browser logs
+system_log_queue = queue.Queue()
+browser1_log_queue = queue.Queue()
+browser2_log_queue = queue.Queue()
+
+def async_log_worker(log_text, log_q):
+    """Background worker that updates the given text widget from the provided log queue."""
+    while True:
+        try:
+            message = log_q.get(timeout=1)
+            log_text.after(0, lambda: log_text.insert(tk.END, message + "\n"))
+            log_text.after(0, log_text.see, tk.END)
+        except queue.Empty:
+            continue
+
+def log_system(message):
+    system_log_queue.put(message)
+
+def log_browser1(message):
+    browser1_log_queue.put(message)
+
+def log_browser2(message):
+    browser2_log_queue.put(message)
+
+def log_by_instance(instance_id, message):
+    if instance_id == 1:
+        log_browser1(message)
+    elif instance_id == 2:
+        log_browser2(message)
+    else:
+        log_system(message)
+
+def log_message(log_text, message):
+    log_text.insert(tk.END, f"{message}\n")
+    log_text.see(tk.END)
+
+def normalize_value(value):
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value)).strip()
+    return str(value).strip()
+
+excel_lock = Lock()
+
+def is_file_locked(filepath):
+    try:
+        with open(filepath, 'a'):
+            return False
+    except IOError:
+        return True
+
 def update_excel_status(excel_file, phone_number, new_status):
-    """
-    Updates the status for a given phone number in the LIST sheet.
-    new_status: 1 (sent), 0 (invalid), or 2 (retry)
-    """
-    try:
-        wb = load_workbook(excel_file)
-        sheet = wb["LIST"]
-        # Assume the header row is row 1:
-        for row in sheet.iter_rows(min_row=2):
-            cell_val = row[0].value  # "Phone Number" is in column A
-            if cell_val is not None and str(cell_val).strip() == phone_number:
-                # Update the Status column (assumed to be column D, index 3)
-                row[3].value = new_status
-                break
-        wb.save(excel_file)
-    except Exception as e:
-        logging.error(f"Failed to update status for {phone_number}: {e}")
+    attempts = 3
+    while attempts > 0:
+        if is_file_locked(excel_file):
+            logging.warning(f"Excel file is locked. Retrying in 2 seconds for phone {phone_number}...")
+            time.sleep(2)
+            attempts -= 1
+        else:
+            break
+    with excel_lock:
+        try:
+            wb = load_workbook(excel_file)
+            sheet = wb[CONFIG["SHEETS"]["LIST"]]
+            headers = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
+            phone_idx = headers.index(CONFIG["COLUMNS"]["LIST"]["phone"])
+            status_idx = headers.index(CONFIG["COLUMNS"]["LIST"]["status"])
+            updated = False
+            for row in sheet.iter_rows(min_row=2):
+                if normalize_value(row[phone_idx].value) == phone_number:
+                    row[status_idx].value = new_status
+                    updated = True
+                    break
+            if updated:
+                wb.save(excel_file)
+                logging.info(f"Updated status for {phone_number} to {new_status}")
+            else:
+                logging.warning(f"Phone number {phone_number} not found in Excel for updating.")
+        except Exception as e:
+            logging.error(f"Failed to update status for {phone_number}: {e}")
 
-def load_documents(excel_file):
-    """
-    Loads the DOCS sheet from the Excel file and returns a mapping of Message Code to list of document file paths.
-    The DOCS sheet is expected to have columns: Message Code, INFO, BROCHURE_1, BROCHURE_2, BROCHURE_3, BROCHURE_4.
-    """
-    docs_mapping = {}
-    try:
-        docs_df = pd.read_excel(excel_file, sheet_name='DOCS')
-        for index, row in docs_df.iterrows():
-            code = row['Message Code']
-            docs_mapping[code] = [
-                row['BROCHURE_1'], row['BROCHURE_2'],
-                row['BROCHURE_3'], row['BROCHURE_4']
-            ]
-    except Exception as e:
-        print(f"Error loading DOCS sheet: {e}")
-    return docs_mapping
+# ---------------------------
+# Personalized Message Function
+# ---------------------------
+def parse_spintax(text):
+    """ Process Spintax: Randomly selects one option from {word1 | word2 | word3} """
+    pattern = re.compile(r"\[([^{}\[\]]*)\]")  # Matches text inside [ ]
+    
+    while re.search(pattern, text):  # Keep replacing spintax until none are left
+        text = re.sub(pattern, lambda m: random.choice(m.group(1).split("|")).strip(), text)
+    
+    return text
 
-class WhatsAppBlaster:
-    def __init__(self):
+def personalize_message(encoded_template, contact):
+    # Step 1: Decode the URL-encoded template
+    decoded_template = urllib.parse.unquote_plus(encoded_template)
+    
+    # Step 2: Replace placeholders with contact details
+    personalized_message = decoded_template.format(
+        name=contact.get("Name", ""),
+        sender=contact.get("Sender", ""),
+        course=contact.get("Course of Interest", "")
+    )
+
+    # Step 3: Process Spintax first
+    spintax_processed = parse_spintax(personalized_message)
+
+    # Step 4: Re-encode the message for WhatsApp URL
+    return urllib.parse.quote_plus(spintax_processed)
+
+# ---------------------------
+# Excel Data Loader
+# ---------------------------
+class ExcelDataLoader:
+    def __init__(self, excel_file):
+        self.excel_file = excel_file
+        self.sheets = self.load_all_sheets()
+
+    def load_all_sheets(self):
+        try:
+            wb = load_workbook(self.excel_file)
+            return {sheet: pd.read_excel(self.excel_file, sheet_name=sheet) for sheet in wb.sheetnames}
+        except Exception as e:
+            logging.error(f"Error loading Excel file: {e}")
+            return {}
+
+    def get_contacts(self):
+        df = self.sheets.get(CONFIG["SHEETS"]["LIST"])
+        if df is not None:
+            df[CONFIG["COLUMNS"]["LIST"]["phone"]] = df[CONFIG["COLUMNS"]["LIST"]["phone"]].apply(normalize_value)
+            df[CONFIG["COLUMNS"]["LIST"]["msg_code"]] = df[CONFIG["COLUMNS"]["LIST"]["msg_code"]].apply(normalize_value)
+            df[CONFIG["COLUMNS"]["LIST"]["doc_code"]] = df[CONFIG["COLUMNS"]["LIST"]["doc_code"]].apply(normalize_value)
+            df[CONFIG["COLUMNS"]["LIST"]["media_code"]] = df[CONFIG["COLUMNS"]["LIST"]["media_code"]].apply(normalize_value)
+        return df
+
+    def get_messages(self):
+        df = self.sheets.get(CONFIG["SHEETS"]["MSGS"])
+        if df is not None:
+            df[CONFIG["COLUMNS"]["MSGS"]["msg_code"]] = df[CONFIG["COLUMNS"]["MSGS"]["msg_code"]].apply(normalize_value)
+        return df
+
+    def get_mapping(self, sheet_key, col_config):
+        mapping = {}
+        df = self.sheets.get(CONFIG["SHEETS"][sheet_key])
+        if df is not None:
+            df[col_config["code"]] = df[col_config["code"]].apply(normalize_value)
+            for _, row in df.iterrows():
+                key = row[col_config["code"]]
+                mapping[key] = [row[col] for col in col_config["files"]]
+        return mapping
+
+    def get_docs(self):
+        return self.get_mapping("DOCS", CONFIG["COLUMNS"]["DOCS"])
+
+    def get_media(self):
+        return self.get_mapping("MEDIA", CONFIG["COLUMNS"]["MEDIA"])
+
+    def get_settings(self):
+        """
+        Load settings from the 'SETTINGS' sheet.
+        Assumes the sheet has columns 'Setting Name' and 'Value'.
+        """
+        if CONFIG["SHEETS"]["SETTINGS"] in self.sheets:
+            df = self.sheets[CONFIG["SHEETS"]["SETTINGS"]]
+            return dict(zip(df["Setting Name"], df["Value"]))
+        return {}
+
+# ---------------------------
+# Browser Manager
+# ---------------------------
+class BrowserManager:
+    def __init__(self, instance_id=None):
         self.driver = None
+        self.instance_id = instance_id
+        self.user_data_path = get_persistent_temp_path(instance_id)
 
     def setup_browser(self, headless=False):
+        if self.driver is not None:
+            try:
+                _ = self.driver.current_url
+                return self.driver
+            except Exception:
+                self.driver = None
         options = Options()
-        options.add_argument(f"--user-data-dir={user_data_path}")
-        options.add_argument("--remote-debugging-port=9222")
+        options.add_argument(f"--user-data-dir={self.user_data_path}")
+        options.add_argument(f"--remote-debugging-port={9222 if self.instance_id is None else 9223 + int(self.instance_id)}")
         options.add_argument("--disable-extensions")
         options.add_argument("--disable-background-networking")
         options.add_argument("--disable-default-apps")
@@ -105,20 +294,25 @@ class WhatsAppBlaster:
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+        options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
         if headless:
             options.add_argument("--headless")
         browser_path, browser_type = self.locate_browser()
         if not browser_path:
-            raise RuntimeError("No supported browser (Chrome, Brave, Edge) found on the system.")
+            raise RuntimeError("No supported browser found on the system.")
         options.binary_location = browser_path
+        # Use settings loaded from Excel for driver version
         if browser_type == "chrome":
-            service = Service(ChromeDriverManager().install())
+            service = ChromeService(ChromeDriverManager(driver_version=settings_dict[CONFIG["COLUMNS"]["Settings"]["wd_chrome_ver"]]).install())
         elif browser_type == "edge":
-            service = Service(EdgeChromiumDriverManager().install())
+            service = EdgeService(EdgeChromiumDriverManager(driver_version=settings_dict[CONFIG["COLUMNS"]["Settings"]["wd_edge_ver"]]).install())
+        elif browser_type == "brave":
+            service = ChromeService(BraveChromeDriverManager(chrome_type=ChromeType.BRAVE, driver_version=settings_dict[CONFIG["COLUMNS"]["Settings"]["wd_brave_ver"]]).install())
         else:
-            service = Service(ChromeDriverManager().install())
+            service = ChromiumService(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
         self.driver = webdriver.Chrome(service=service, options=options)
+        log_system(f"Browser instance {self.instance_id} initialized")
         return self.driver
 
     def locate_browser(self):
@@ -147,7 +341,7 @@ class WhatsAppBlaster:
             chrome_paths = ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
             edge_paths = ["/usr/bin/microsoft-edge"]
         else:
-            raise RuntimeError(f"Unsupported operating system: {system}")
+            raise RuntimeError(f"Unsupported OS: {system}")
         for path in brave_paths:
             if os.path.exists(path):
                 return path, "brave"
@@ -159,307 +353,383 @@ class WhatsAppBlaster:
                 return path, "edge"
         return None, None
 
-    def first_time_setup(self, log_text, headless=False):
-        log_text.insert(tk.END, "Launching browser for first-time setup...\n")
-        try:
-            self.driver = self.setup_browser(headless=headless)
-            self.driver.get("https://web.whatsapp.com")
-            log_text.insert(tk.END, "Waiting for WhatsApp Web login...\n")
-            WebDriverWait(self.driver, 300).until(
-                EC.presence_of_element_located((By.XPATH, "//canvas[@aria-label='Scan me!']"))
-            )
-            log_text.insert(tk.END, "QR code loaded. Please scan with your phone.\n")
-            WebDriverWait(self.driver, 300).until_not(
-                EC.presence_of_element_located((By.XPATH, "//canvas[@aria-label='Scan me!']"))
-            )
-            log_text.insert(tk.END, "Logged into WhatsApp Web successfully.\n")
-        except NoSuchWindowException:
-            log_text.insert(tk.END, "Browser closed. Setup complete.\n")
-        except WebDriverException as e:
-            log_text.insert(tk.END, f"Unexpected error during setup: {e}\n")
-        finally:
+    def quit(self):
+        if self.driver:
             try:
                 self.driver.quit()
             except Exception:
                 pass
+            self.driver = None
 
-    def send_messages(self, log_text, excel_file, timer_min, timer_max, headless=False):
-        log_text.insert(tk.END, "Starting the WhatsApp message blaster...\n")
-        try:
-            self.driver = self.setup_browser(headless=headless)
-            self.driver.get("https://web.whatsapp.com")
-            log_text.insert(tk.END, "Waiting for WhatsApp Web to load...\n")
-            WebDriverWait(self.driver, 120).until(
-                EC.presence_of_element_located((By.XPATH, "//div[@id='pane-side']"))
-            )
-            log_text.insert(tk.END, "WhatsApp Web loaded successfully.\n")
-            # Load Excel data from Template file
-            contacts_df = pd.read_excel(excel_file, sheet_name='LIST')
-            messages_df = pd.read_excel(excel_file, sheet_name='MSGS')
-            docs_mapping = load_documents(excel_file)
-            log_text.insert(tk.END, f"Found {len(contacts_df)} contacts, {len(messages_df)} message templates, and document mappings for {len(docs_mapping)} codes.\n")
-            for index, contact in contacts_df.iterrows():
-                if stop_event.is_set():
-                    log_text.insert(tk.END, "Process stopped by user.\n")
-                    break
-                # Skip contacts already marked as sent (status 1)
-                if contact.get('Status') == 1:
-                    continue
-
-                try:
-                    # Ensure phone number is a string without a decimal point
-                    num = contact['Phone Number']
-                    if isinstance(num, float):
-                        phone_number = str(int(num))
-                    else:
-                        phone_number = str(num).strip()
-                    message_code = contact['Message Code']
-                    # Look up the message by code in MSGS
-                    message_row = messages_df[messages_df['Message Code'] == message_code]
-                    if message_row.empty:
-                        log_text.insert(tk.END, f"No message found for code {message_code}. Skipping {phone_number}.\n")
-                        update_excel_status(excel_file, phone_number, 0)  # Mark invalid
-                        continue
-                    encoded_message = message_row.iloc[0]['Message Encoded']
-                    # First, send the text message
-                    whatsapp_url = f"https://web.whatsapp.com/send?phone={phone_number}&text={encoded_message}"
-                    self.driver.get(whatsapp_url)
-                    time.sleep(random.uniform(timer_min, timer_max))
-                    try:
-                        send_button = self.driver.find_element(By.XPATH, "//span[@data-icon='send']")
-                        send_button.click()
-                        log_text.insert(tk.END, f"Text message sent to {phone_number}.\n")
-                    except NoSuchElementException:
-                        log_text.insert(tk.END, f"Send button not found for {phone_number}. Marking as retry.\n")
-                        update_excel_status(excel_file, phone_number, 2)  # Retry
-                        continue
-
-                    # If document attachments are needed, reenter chat and upload docs
-                    if message_code in docs_mapping:
-                        brochure_paths = docs_mapping[message_code]
-                        # Reenter chat with only the phone number (no text)
-                        whatsapp_url_no_text = f"https://web.whatsapp.com/send?phone={phone_number}"
-                        self.driver.get(whatsapp_url_no_text)
-                        time.sleep(random.uniform(timer_min, timer_max))
-                        try:
-                            attach_button = self.driver.find_element(By.XPATH, "//*[@id='main']/footer/div[1]/div/span/div/div[1]/div/button")
-                            attach_button.click()
-                            time.sleep(1)
-                            doc_option = self.driver.find_element(By.XPATH, "//*[@id='app']/div/span[5]/div/ul/div/div/div[1]/li")
-                            doc_option.click()
-                            time.sleep(1)
-                            file_input = self.driver.find_element(By.XPATH, "//input[@accept='*']")
-                            file_input.send_keys("\n".join(brochure_paths))
-                            time.sleep(3)  # Wait for documents to upload
-                            log_text.insert(tk.END, f"Documents attached for {phone_number}.\n")
-                            send_button = self.driver.find_element(By.XPATH, "//span[@data-icon='send']")
-                            send_button.click()
-                            log_text.insert(tk.END, f"Document message sent to {phone_number}.\n")
-                        except Exception as e:
-                            log_text.insert(tk.END, f"Error attaching documents for {phone_number}: {e}\n")
-                            update_excel_status(excel_file, phone_number, 2)
-                            continue
-                    # If no document attachment is needed, or after document message is sent, mark as sent.
-                    update_excel_status(excel_file, phone_number, 1)
-                    time.sleep(random.uniform(timer_min, timer_max))
-                except Exception as e:
-                    log_text.insert(tk.END, f"Error processing {phone_number}: {e}\n")
-                    update_excel_status(excel_file, phone_number, 2)  # Mark for retry
-            log_text.insert(tk.END, "Initial processing complete. Closing browser.\n")
-            self.driver.quit()
-            # Now, attempt to retry messages marked with status 2
-            self.retry_failed_messages(log_text, excel_file, timer_min, timer_max, headless)
-        except Exception as e:
-            log_text.insert(tk.END, f"Error: {e}\n")
-        finally:
-            stop_event.clear()
-
-    def retry_failed_messages(self, log_text, excel_file, timer_min, timer_max, headless=False):
-        log_text.insert(tk.END, "Starting retry process for messages marked as retry (status 2)...\n")
-        try:
-            # Reload contacts from Excel
-            contacts_df = pd.read_excel(excel_file, sheet_name='LIST')
-            # Filter contacts with status == 2
-            retry_df = contacts_df[contacts_df['Status'] == 2]
-            log_text.insert(tk.END, f"{len(retry_df)} contacts marked for retry.\n")
-            if retry_df.empty:
-                log_text.insert(tk.END, "No contacts to retry.\n")
-                return
-            # Reload document mappings for retries
-            docs_mapping = load_documents(excel_file)
-            log_text.insert(tk.END, f"Loaded document mappings for {len(docs_mapping)} codes during retry.\n")
-            self.driver = self.setup_browser(headless=headless)
-            self.driver.get("https://web.whatsapp.com")
-            WebDriverWait(self.driver, 120).until(
-                EC.presence_of_element_located((By.XPATH, "//div[@id='pane-side']"))
-            )
-            for index, contact in retry_df.iterrows():
-                if stop_event.is_set():
-                    log_text.insert(tk.END, "Retry process stopped by user.\n")
-                    break
-                try:
-                    num = contact['Phone Number']
-                    if isinstance(num, float):
-                        phone_number = str(int(num))
-                    else:
-                        phone_number = str(num).strip()
-                    message_code = contact['Message Code']
-                    message_row = pd.read_excel(excel_file, sheet_name='MSGS')
-                    message_row = message_row[message_row['Message Code'] == message_code]
-                    if message_row.empty:
-                        log_text.insert(tk.END, f"No message found for code {message_code}. Skipping retry for {phone_number}.\n")
-                        update_excel_status(excel_file, phone_number, 0)
-                        continue
-                    encoded_message = message_row.iloc[0]['Message Encoded']
-                    # Send text message for retry
-                    whatsapp_url = f"https://web.whatsapp.com/send?phone={phone_number}&text={encoded_message}"
-                    self.driver.get(whatsapp_url)
-                    time.sleep(random.uniform(timer_min, timer_max))
-                    try:
-                        send_button = self.driver.find_element(By.XPATH, "//span[@data-icon='send']")
-                        send_button.click()
-                        log_text.insert(tk.END, f"Retry: Text message sent to {phone_number}.\n")
-                    except NoSuchElementException:
-                        log_text.insert(tk.END, f"Retry: Send button not found for {phone_number}. Marking as invalid.\n")
-                        update_excel_status(excel_file, phone_number, 0)
-                        continue
-                    
-                    if message_code in docs_mapping:
-                        brochure_paths = docs_mapping[message_code]
-                        # Reenter chat without text
-                        whatsapp_url_no_text = f"https://web.whatsapp.com/send?phone={phone_number}"
-                        self.driver.get(whatsapp_url_no_text)
-                        time.sleep(random.uniform(timer_min, timer_max))
-                        try:
-                            attach_button = self.driver.find_element(By.XPATH, "//*[@id='main']/footer/div[1]/div/span/div/div[1]/div/button")
-                            attach_button.click()
-                            time.sleep(1)
-                            doc_option = self.driver.find_element(By.XPATH, "//*[@id='app']/div/span[5]/div/ul/div/div/div[1]/li")
-                            doc_option.click()
-                            time.sleep(1)
-                            file_input = self.driver.find_element(By.XPATH, "//input[@accept='*']")
-                            file_input.send_keys("\n".join(brochure_paths))
-                            time.sleep(3)
-                            log_text.insert(tk.END, f"Retry: Documents attached for {phone_number}.\n")
-                            send_button = self.driver.find_element(By.XPATH, "//span[@data-icon='send']")
-                            send_button.click()
-                            log_text.insert(tk.END, f"Retry: Document message sent to {phone_number}.\n")
-                        except Exception as e:
-                            log_text.insert(tk.END, f"Retry: Error attaching documents for {phone_number}: {e}\n")
-                            update_excel_status(excel_file, phone_number, 0)
-                            continue
-                    update_excel_status(excel_file, phone_number, 1)
-                    time.sleep(random.uniform(timer_min, timer_max))
-                except Exception as e:
-                    log_text.insert(tk.END, f"Retry: Error processing {phone_number}: {e}\n")
-                    update_excel_status(excel_file, phone_number, 0)
-            log_text.insert(tk.END, "Retry process completed. Closing browser.\n")
-            self.driver.quit()
-        except Exception as e:
-            log_text.insert(tk.END, f"Retry process error: {e}\n")
-
-# New function to download the template Excel file
-def download_template():
+# ---------------------------
+# WhatsApp Messaging Functions
+# ---------------------------
+def send_text_message(driver, phone_number, encoded_message, contact, instance_id):
+    # Apply personalization & Spintax
+    final_encoded_message = personalize_message(encoded_message, contact)
+    
+    # WhatsApp URL with the final personalized and randomized message
+    url = f"https://web.whatsapp.com/send?phone={phone_number}&text={final_encoded_message}"
+    
+    driver.get(url)
     try:
-        # When bundled using PyInstaller, the template will be in sys._MEIPASS
-        if getattr(sys, 'frozen', False):
-            base_path = sys._MEIPASS
-        else:
-            base_path = os.path.abspath(".")
-        template_path = os.path.join(base_path, "Template.xlsx")
-        destination = filedialog.asksaveasfilename(
-            defaultextension=".xlsx",
-            filetypes=[("Excel Files", "*.xlsx")],
-            initialfile="Template.xlsx",
-            title="Save Template As"
+        WebDriverWait(driver, 10).until(
+            lambda d: CONFIG["INVALID_MSG"] in d.page_source or 
+                      d.find_element(By.XPATH, settings_dict[CONFIG["COLUMNS"]["Settings"]["xpath_text"]])
         )
-        if destination:
-            shutil.copyfile(template_path, destination)
-            messagebox.showinfo("Download Template", f"Template saved to {destination}")
-    except Exception as e:
-        messagebox.showerror("Error", f"Failed to download template: {e}")
+    except TimeoutException:
+        log_system(f"[Instance {instance_id}] Timeout waiting for elements for {phone_number}.")
+        return False
+    
+    if CONFIG["INVALID_MSG"] in driver.page_source:
+        log_system(f"[Instance {instance_id}] Invalid phone number {phone_number}.")
+        return "INVALID"
 
+    time.sleep(random.uniform(float(settings_dict[CONFIG["COLUMNS"]["Settings"]["min_timer"]]),
+                                float(settings_dict[CONFIG["COLUMNS"]["Settings"]["max_timer"]])))
+
+    try:
+        driver.find_element(By.XPATH, settings_dict[CONFIG["COLUMNS"]["Settings"]["xpath_text"]]).click()
+        time.sleep(1)
+        log_system(f"[Instance {instance_id}] Text message sent to {phone_number}.")
+        return True
+    except NoSuchElementException:
+        log_system(f"[Instance {instance_id}] Send button not found for {phone_number}.")
+        return False
+
+def attach_files(driver, phone_number, file_paths, xpath, instance_id):
+    whatsapp_url = f"https://web.whatsapp.com/send?phone={phone_number}"
+    driver.get(whatsapp_url)
+    try:
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, settings_dict[CONFIG["COLUMNS"]["Settings"]["xpath_attach"]]))
+        )
+        attach_btn = driver.find_element(By.XPATH, settings_dict[CONFIG["COLUMNS"]["Settings"]["xpath_attach"]])
+        time.sleep(1)
+        attach_btn.click()
+        try:
+            option = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, xpath)))
+            option.click()
+        except TimeoutException:
+            log_system(f"[Instance {instance_id}] Could not find document/media option for {phone_number}.")
+            return False
+        try:
+            file_input = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.XPATH, "//input[@accept='*']"))
+            )
+            valid_paths = [str(p).strip() for p in file_paths if pd.notna(p)]
+            if valid_paths:
+                file_input.send_keys("\n".join(valid_paths))
+                time.sleep(2)
+                send_btn = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, settings_dict[CONFIG["COLUMNS"]["Settings"]["xpath_asend"]]))
+                )
+                send_btn.click()
+                log_system(f"[Instance {instance_id}] Files sent to {phone_number}.")
+                return True
+            else:
+                log_system(f"[Instance {instance_id}] No valid files for {phone_number} using {xpath}.")
+                return False
+        except TimeoutException:
+            log_system(f"[Instance {instance_id}] File input field not found for {phone_number}.")
+            return False
+    except Exception as e:
+        log_system(f"[Instance {instance_id}] Error attaching files for {phone_number}: {e}")
+        return False
+
+def process_contact(driver, contact, messages_df, docs_mapping, media_mapping, excel_file, instance_id):
+    phone = contact.get(CONFIG["COLUMNS"]["LIST"]["phone"])
+    msg_code = contact.get(CONFIG["COLUMNS"]["LIST"]["msg_code"])
+    doc_code = contact.get(CONFIG["COLUMNS"]["LIST"]["doc_code"])
+    media_code = contact.get(CONFIG["COLUMNS"]["LIST"]["media_code"])
+    sent_successfully = False
+
+    if msg_code:
+        message_row = messages_df[messages_df[CONFIG["COLUMNS"]["MSGS"]["msg_code"]] == msg_code]
+        if not message_row.empty:
+            encoded = message_row.iloc[0][CONFIG["COLUMNS"]["MSGS"]["message"]]
+            
+            # Pass the whole contact dictionary to personalize and apply Spintax
+            result = send_text_message(driver, phone, encoded, contact, instance_id)
+            
+            if result == "INVALID":
+                update_excel_status(excel_file, phone, CONFIG["STATUS_VALUES"]["INVALID"])
+                return
+            elif result:
+                sent_successfully = True
+
+    if doc_code and doc_code != "0" and doc_code in docs_mapping:
+        result = attach_files(driver, phone, docs_mapping[doc_code], settings_dict[CONFIG["COLUMNS"]["Settings"]["xpath_docs"]], instance_id)
+        sent_successfully = sent_successfully or result
+    else:
+        log_by_instance(instance_id, f"Skipping document attachment for {phone} (Doc Code: {doc_code}).")
+
+    if media_code and media_code != "0" and media_code in media_mapping:
+        result = attach_files(driver, phone, media_mapping[media_code], settings_dict[CONFIG["COLUMNS"]["Settings"]["xpath_media"]], instance_id)
+        sent_successfully = sent_successfully or result
+    else:
+        log_by_instance(instance_id, f"Skipping media attachment for {phone} (Media Code: {media_code}).")
+
+    if sent_successfully:
+        update_excel_status(excel_file, phone, CONFIG["STATUS_VALUES"]["SENT"])
+    else:
+        update_excel_status(excel_file, phone, CONFIG["STATUS_VALUES"]["RETRY"])
+
+    time.sleep(random.uniform(float(settings_dict[CONFIG["COLUMNS"]["Settings"]["min_timer"]]),
+                              float(settings_dict[CONFIG["COLUMNS"]["Settings"]["max_timer"]])))
+
+# ---------------------------
+# Dual-Browser WhatsApp Blaster Implementation
+# ---------------------------
+class DualBrowserWhatsAppBlaster:
+    def __init__(self):
+        self.browser_manager_1 = BrowserManager(instance_id=1)
+        self.browser_manager_2 = BrowserManager(instance_id=2)
+        self.log_updater_active = False
+        self.thread_log_updater = None
+
+    def start_log_updater(self, log_text):
+        self.log_updater_active = True
+        def update_logs():
+            while self.log_updater_active:
+                try:
+                    message = system_log_queue.get(timeout=0.1)
+                    log_text.after(0, lambda: log_text.insert(tk.END, message + "\n"))
+                    log_text.after(0, log_text.see, tk.END)
+                except queue.Empty:
+                    pass
+                except Exception as e:
+                    logging.error(f"Error in log updater: {e}")
+        self.thread_log_updater = threading.Thread(target=update_logs)
+        self.thread_log_updater.daemon = True
+        self.thread_log_updater.start()
+
+    def stop_log_updater(self):
+        self.log_updater_active = False
+        if self.thread_log_updater:
+            self.thread_log_updater.join(timeout=1.0)
+            self.thread_log_updater = None
+
+    def process_contacts_thread(self, driver, contacts_df, messages_df, docs_mapping, media_mapping, excel_file, instance_id):
+        try:
+            driver.get("https://web.whatsapp.com")
+            log_by_instance(instance_id, f"[Instance {instance_id}] Waiting for WhatsApp Web to load...")
+            WebDriverWait(driver, 120).until(EC.presence_of_element_located((By.XPATH, "//div[@id='pane-side']")))
+            log_by_instance(instance_id, f"[Instance {instance_id}] WhatsApp Web loaded successfully.")
+            for _, contact in contacts_df.iterrows():
+                if stop_event.is_set():
+                    log_by_instance(instance_id, f"[Instance {instance_id}] Stopping processing due to user request.")
+                    break
+                if contact.get(CONFIG["COLUMNS"]["LIST"]["status"]) in [CONFIG["STATUS_VALUES"]["INVALID"], CONFIG["STATUS_VALUES"]["SENT"]]:
+                    continue
+                try:
+                    process_contact(driver, contact, messages_df, docs_mapping, media_mapping, excel_file, instance_id)
+                except Exception as e:
+                    log_by_instance(instance_id, f"[Instance {instance_id}] Error processing {contact.get(CONFIG['COLUMNS']['LIST']['phone'])}: {e}")
+                    update_excel_status(excel_file, contact.get(CONFIG["COLUMNS"]["LIST"]["phone"]), CONFIG["STATUS_VALUES"]["RETRY"])
+            log_by_instance(instance_id, f"[Instance {instance_id}] Initial processing complete.")
+        except Exception as e:
+            log_by_instance(instance_id, f"[Instance {instance_id}] Thread error: {e}")
+
+    def retry_failed_contacts_thread(self, driver, retry_df, messages_df, docs_mapping, media_mapping, excel_file, instance_id):
+        try:
+            if retry_df.empty:
+                log_by_instance(instance_id, f"[Instance {instance_id}] No contacts to retry.")
+                return
+            driver.get("https://web.whatsapp.com")
+            WebDriverWait(driver, 120).until(EC.presence_of_element_located((By.XPATH, "//div[@id='pane-side']")))
+            for _, contact in retry_df.iterrows():
+                if stop_event.is_set():
+                    log_by_instance(instance_id, f"[Instance {instance_id}] Stopping retry process due to user request.")
+                    break
+                try:
+                    process_contact(driver, contact, messages_df, docs_mapping, media_mapping, excel_file, instance_id)
+                except Exception as e:
+                    log_by_instance(instance_id, f"[Instance {instance_id}] Retry error for {contact.get(CONFIG['COLUMNS']['LIST']['phone'])}: {e}")
+                    update_excel_status(excel_file, contact.get(CONFIG["COLUMNS"]["LIST"]["phone"]), CONFIG["STATUS_VALUES"]["INVALID"])
+            log_by_instance(instance_id, f"[Instance {instance_id}] Retry process completed for instance {instance_id}.")
+        except Exception as e:
+            log_by_instance(instance_id, f"[Instance {instance_id}] Thread error in retry: {e}")
+
+    def send_messages(self, log_text, excel_file, headless):
+        stop_event.clear()
+        self.start_log_updater(log_text)
+        log_system("Starting dual browser WhatsApp blaster...")
+        loader = ExcelDataLoader(excel_file)
+        global settings_dict
+        settings_dict = loader.get_settings()
+        if settings_dict:
+            CONFIG["WEBDRIVER_VER"] = {
+                "CHROME": settings_dict[CONFIG["COLUMNS"]["Settings"]["wd_chrome_ver"]],
+                "EDGE": settings_dict[CONFIG["COLUMNS"]["Settings"]["wd_edge_ver"]],
+                "BRAVE": settings_dict[CONFIG["COLUMNS"]["Settings"]["wd_brave_ver"]]
+            }
+            CONFIG["INVALID_MSG"] = settings_dict[CONFIG["COLUMNS"]["Settings"]["invalid_message"]]
+            CONFIG["TIMER"] = {
+                "MIN": float(settings_dict[CONFIG["COLUMNS"]["Settings"]["min_timer"]]),
+                "MAX": float(settings_dict[CONFIG["COLUMNS"]["Settings"]["max_timer"]])
+            }
+        contacts = loader.get_contacts()
+        messages = loader.get_messages()
+        docs = loader.get_docs()
+        media = loader.get_media()
+        even_contacts = contacts.iloc[::2].copy()
+        odd_contacts = contacts.iloc[1::2].copy()
+        log_system(f"Total contacts: {len(contacts)}, Even: {len(even_contacts)}, Odd: {len(odd_contacts)}")
+        try:
+            driver1 = self.browser_manager_1.setup_browser(headless)
+            driver2 = self.browser_manager_2.setup_browser(headless)
+            thread1 = threading.Thread(
+                target=self.process_contacts_thread,
+                args=(driver1, even_contacts, messages, docs, media, excel_file, 1)
+            )
+            thread2 = threading.Thread(
+                target=self.process_contacts_thread,
+                args=(driver2, odd_contacts, messages, docs, media, excel_file, 2)
+            )
+            thread1.start()
+            thread2.start()
+            thread1.join()
+            thread2.join()
+            log_system("Initial processing complete in both browsers.")
+            loader = ExcelDataLoader(excel_file)
+            contacts = loader.get_contacts()
+            retry_df = contacts[contacts[CONFIG["COLUMNS"]["LIST"]["status"]] == CONFIG["STATUS_VALUES"]["RETRY"]]
+            log_system(f"{len(retry_df)} contacts marked for retry.")
+            if not retry_df.empty:
+                even_retry = retry_df.iloc[::2].copy()
+                odd_retry = retry_df.iloc[1::2].copy()
+                retry_thread1 = threading.Thread(
+                    target=self.retry_failed_contacts_thread,
+                    args=(driver1, even_retry, messages, docs, media, excel_file, 1)
+                )
+                retry_thread2 = threading.Thread(
+                    target=self.retry_failed_contacts_thread,
+                    args=(driver2, odd_retry, messages, docs, media, excel_file, 2)
+                )
+                retry_thread1.start()
+                retry_thread2.start()
+                retry_thread1.join()
+                retry_thread2.join()
+            log_system("All processing completed. Closing browsers.")
+        except Exception as e:
+            log_system(f"Error in dual browser operation: {e}")
+        finally:
+            self.browser_manager_1.quit()
+            self.browser_manager_2.quit()
+            self.stop_log_updater()
+
+# ---------------------------
+# GUI and Main Execution
+# ---------------------------
 def create_gui():
     root = tk.Tk()
-    root.title("WhatsApp Blaster (Excel Version)")
-    root.geometry("430x360")
+    root.title("HWUM WhatsApp Blaster")
+    root.geometry("480x500")
     root.configure(bg="#333333")
-    root.resizable(width=False, height=False)
-    tk.Label(root, text="WhatsApp Blaster", bg="#333333", fg="white", font=("Arial", 20)).pack(pady=5)
-    # Frame for buttons
+    root.resizable(False, False)
+    tk.Label(root, text="HWUM WhatsApp Blaster", bg="#333333", fg="white", font=("Arial", 20)).pack(pady=5)
     button_frame = tk.Frame(root, bg="#333333")
     button_frame.pack(pady=10)
     excel_file = tk.StringVar()
-    timer_min = tk.StringVar(value=str(TIMER_MIN))
-    timer_max = tk.StringVar(value=str(TIMER_MAX))
     headless_mode = tk.BooleanVar(value=False)
-    blaster = WhatsAppBlaster()
-
+    blaster = DualBrowserWhatsAppBlaster()
+    def download_template():
+        try:
+            base_path = sys._MEIPASS if getattr(sys, 'frozen', False) else os.path.abspath(".")
+            template_path = os.path.join(base_path, "Template.xlsx")
+            destination = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel Files", "*.xlsx")], initialfile="Template.xlsx", title="Save Template As")
+            if destination:
+                shutil.copyfile(template_path, destination)
+                messagebox.showinfo("Download Template", f"Template saved to {destination}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to download template: {e}")
     def import_excel():
-        file_path = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsm *.xlsx")])
-        if file_path:
-            excel_file.set(file_path)
-            log_text.insert(tk.END, f"Excel file loaded: {file_path}\n")
-            try:
-                contacts_df = pd.read_excel(file_path, sheet_name='LIST')
-                messages_df = pd.read_excel(file_path, sheet_name='MSGS')
-                docs_df = pd.read_excel(file_path, sheet_name='DOCS')
-                log_text.insert(tk.END, f"Found {len(contacts_df)} contacts in LIST sheet.\n")
-                log_text.insert(tk.END, f"Found {len(messages_df)} message templates in MSGS sheet.\n")
-                log_text.insert(tk.END, f"Found {len(docs_df)} document sets in DOCS sheet.\n")
-            except Exception as e:
-                log_text.insert(tk.END, f"Error reading Excel file: {e}\n")
-    
+        path = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsm *.xlsx")])
+        if path:
+            excel_file.set(path)
+            log_system(f"Excel file loaded: {path}")
+            loader = ExcelDataLoader(path)
+            global settings_dict
+            settings_dict = loader.get_settings()
+            if settings_dict:
+                log_system("Settings successfully loaded from Excel.")
+            else:
+                log_system("Warning: No settings found in the Excel file.")
     def first_time_setup_wrapper():
-        threading.Thread(target=blaster.first_time_setup, args=(log_text, headless_mode.get())).start()
-    
+        if not excel_file.get():
+            messagebox.showerror("Error", "Please load an Excel file first.")
+            return
+        if not settings_dict:
+            messagebox.showerror("Error", "Settings not loaded. Please check your Excel file.")
+            return
+        def setup_browsers():
+            try:
+                blaster.browser_manager_1.setup_browser(headless_mode.get())
+                blaster.browser_manager_2.setup_browser(headless_mode.get())
+                log_system("Both browser instances launched. Scan QR codes to login.")
+            except Exception as e:
+                log_system(f"Error initializing browsers: {e}")
+        threading.Thread(target=setup_browsers).start()
     def send_messages_wrapper():
         if not excel_file.get():
             messagebox.showerror("Error", "Please load an Excel file first.")
             return
-        try:
-            timer_min_val = float(timer_min.get())
-            timer_max_val = float(timer_max.get())
-            if timer_min_val >= timer_max_val or timer_min_val < 0 or timer_max_val < 0:
-                raise ValueError("Invalid timer values.")
-        except ValueError:
-            messagebox.showerror("Error", "Please enter valid numeric timer values.")
-            return
-        threading.Thread(target=blaster.send_messages, args=(log_text, excel_file.get(), timer_min_val, timer_max_val, headless_mode.get())).start()
-    
+        threading.Thread(target=blaster.send_messages, args=(system_log_text, excel_file.get(), headless_mode.get())).start()
     def stop_process():
         stop_event.set()
-        log_text.insert(tk.END, "Stopping process...\n")
-    
-    # Arrange buttons
+        log_system("Stopping process...")
+        blaster.browser_manager_1.quit()
+        blaster.browser_manager_2.quit()
+        for proc in psutil.process_iter(attrs=["pid", "name"]):
+            if "chromedriver" in proc.info["name"].lower():
+                try:
+                    proc.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+        log_system("All processes stopped.")
+    def toggle_headless():
+        headless_mode.set(not headless_mode.get())
+        headless_button.config(text="Headless" if headless_mode.get() else "Not Headless")
+    def open_encoder():
+        enc_win = tk.Toplevel()
+        enc_win.title("Message Encoder")
+        enc_win.resizable(False, False)
+        ttk.Label(enc_win, text="Input Message:").pack(padx=10, pady=(10,0), anchor="w")
+        input_text = tk.Text(enc_win, height=10, width=50)
+        input_text.pack(padx=10, pady=(0,10))
+        ttk.Label(enc_win, text="Encoded Message:").pack(padx=10, pady=(10,0), anchor="w")
+        output_text = tk.Text(enc_win, height=10, width=50)
+        output_text.pack(padx=10, pady=(0,10))
+        def encode_message():
+            msg = input_text.get("1.0", tk.END).strip()
+            encoded = urllib.parse.quote_plus(msg)
+            output_text.delete("1.0", tk.END)
+            output_text.insert(tk.END, encoded)
+        ttk.Button(enc_win, text="Encode Message", command=encode_message).pack(pady=(0,10))
+    ttk.Button(root, text="Encoder", command=open_encoder, width=65).pack(pady=2)
     ttk.Button(button_frame, text="Download Template", width=20, command=download_template).grid(row=0, column=0, padx=5, pady=5)
     ttk.Button(button_frame, text="Import Excel", width=20, command=import_excel).grid(row=0, column=1, padx=5, pady=5)
     ttk.Button(button_frame, text="Launch WA Web", width=20, command=first_time_setup_wrapper).grid(row=0, column=2, padx=5, pady=5)
     ttk.Button(button_frame, text="RUN", width=20, command=send_messages_wrapper).grid(row=1, column=0, padx=5, pady=5)
     ttk.Button(button_frame, text="STOP", width=20, command=stop_process).grid(row=1, column=1, padx=5, pady=5)
-    
-    
-    def toggle_headless():
-        if headless_mode.get():
-            headless_mode.set(False)
-            headless_button.config(text="Not Headless", style="TButton")
-        else:
-            headless_mode.set(True)
-            headless_button.config(text="Headless", style="TButton")
-    
     headless_button = ttk.Button(button_frame, text="Not Headless", command=toggle_headless, width=20)
     headless_button.grid(row=1, column=2, padx=5, pady=5)
-    
-    timer_frame = tk.Frame(root, bg="#333333")
-    timer_frame.pack(pady=10)
-    tk.Label(timer_frame, text="Min Timer (sec):", bg="#333333", fg="white").pack(side=tk.LEFT, padx=5)
-    tk.Entry(timer_frame, textvariable=timer_min, width=5).pack(side=tk.LEFT, padx=5)
-    tk.Label(timer_frame, text="Max Timer (sec):", bg="#333333", fg="white").pack(side=tk.LEFT, padx=5)
-    tk.Entry(timer_frame, textvariable=timer_max, width=5).pack(side=tk.LEFT, padx=5)
     tk.Label(root, text="Logs", bg="#333333", fg="white", font=("Arial", 12)).pack(anchor="w", padx=10)
-    log_text = scrolledtext.ScrolledText(root, width=70, height=7, font=("Arial", 10))
-    log_text.pack(padx=10, pady=10)
+    system_log_text = tk.Text(root, width=55, height=5, bg="lightyellow")
+    system_log_text.pack(pady=5)
+    browser1_log_text = tk.Text(root, width=55, height=5, bg="lightblue")
+    browser1_log_text.pack(pady=5)
+    browser2_log_text = tk.Text(root, width=55, height=5, bg="lightgreen")
+    browser2_log_text.pack(pady=5)
+    threading.Thread(target=async_log_worker, args=(browser1_log_text, browser1_log_queue), daemon=True).start()
+    threading.Thread(target=async_log_worker, args=(browser2_log_text, browser2_log_queue), daemon=True).start()
     tk.Label(root, text="qt3000@hw.ac.uk", bg="#333333", fg="white", font=("Arial", 10)).pack(side=tk.BOTTOM, pady=1)
+    def cleanup():
+        blaster.browser_manager_1.quit()
+        blaster.browser_manager_2.quit()
+        root.destroy()
+    root.protocol("WM_DELETE_WINDOW", cleanup)
     root.mainloop()
 
 if __name__ == "__main__":
