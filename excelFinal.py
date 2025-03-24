@@ -625,12 +625,12 @@ class DualBrowserWhatsAppBlaster:
 def create_gui():
     root = tk.Tk()
     root.title("HWUM WhatsApp Blaster")
-    root.geometry("480x500")
+    root.geometry("480x530")
     root.configure(bg="#333333")
     root.resizable(False, False)
     tk.Label(root, text="HWUM WhatsApp Blaster", bg="#333333", fg="white", font=("Arial", 20)).pack(pady=5)
     button_frame = tk.Frame(root, bg="#333333")
-    button_frame.pack(pady=10)
+    button_frame.pack(pady=5)
     excel_file = tk.StringVar()
     headless_mode = tk.BooleanVar(value=False)
     blaster = DualBrowserWhatsAppBlaster()
@@ -707,7 +707,23 @@ def create_gui():
             output_text.delete("1.0", tk.END)
             output_text.insert(tk.END, encoded)
         ttk.Button(enc_win, text="Encode Message", command=encode_message).pack(pady=(0,10))
+    def delete_temp_folders():
+        """ Deletes 'whatsapp_blaster_data_1' and 'whatsapp_blaster_data_2' from %temp% """
+        temp_dir = tempfile.gettempdir()
+        folders_to_delete = ["whatsapp_blaster_data_1", "whatsapp_blaster_data_2"]
+        
+        for folder in folders_to_delete:
+            folder_path = os.path.join(temp_dir, folder)
+            if os.path.exists(folder_path):
+                try:
+                    shutil.rmtree(folder_path)  # Delete the folder and its contents
+                    messagebox.showinfo("Success", f"Deleted: {folder}")
+                except Exception as e:
+                    messagebox.showerror("Error", f"Could not delete {folder}: {e}")
+            else:
+                messagebox.showwarning("Not Found", f"{folder} does not exist.")
     ttk.Button(root, text="Encoder", command=open_encoder, width=65).pack(pady=2)
+    ttk.Button(root, text="Reset", command=delete_temp_folders, width=65).pack(pady=2)
     ttk.Button(button_frame, text="Download Template", width=20, command=download_template).grid(row=0, column=0, padx=5, pady=5)
     ttk.Button(button_frame, text="Import Excel", width=20, command=import_excel).grid(row=0, column=1, padx=5, pady=5)
     ttk.Button(button_frame, text="Launch WA Web", width=20, command=first_time_setup_wrapper).grid(row=0, column=2, padx=5, pady=5)
